@@ -17,7 +17,12 @@ const DEFAULT_SETTINGS = {
     posX: null,
     posY: null,
     dragBoundaryPadding: 8,
-    aiEnabled: false,
+    reactionMode: "fixed", // 'fixed' | 'mainApi' | 'customApi'
+    customApi: {
+        baseUrl: "",   // 例如 https://your-proxy.com/v1/chat/completions
+        apiKey: "",
+        model: "",
+    },
     zonePhrases: structuredClone(DEFAULT_ZONE_PHRASES),
 };
 
@@ -51,6 +56,15 @@ function loadSettings() {
             extension_settings[EXT_NAME][key] = structuredClone(DEFAULT_SETTINGS[key]);
         }
     }
+    // 旧版本(aiEnabled布尔值)迁移到新的reactionMode
+    if (extension_settings[EXT_NAME].aiEnabled === true && !extension_settings[EXT_NAME]._migratedReactionMode) {
+        extension_settings[EXT_NAME].reactionMode = "mainApi";
+    }
+    extension_settings[EXT_NAME]._migratedReactionMode = true;
+    if (!extension_settings[EXT_NAME].customApi) {
+        extension_settings[EXT_NAME].customApi = structuredClone(DEFAULT_SETTINGS.customApi);
+    }
+
     if (!extension_settings[EXT_NAME].zonePhrases) {
         extension_settings[EXT_NAME].zonePhrases = structuredClone(DEFAULT_ZONE_PHRASES);
     }
@@ -146,22 +160,69 @@ function getZoneFromClientY(clientY) {
     return "tail";
 }
 
-async function generateAIReaction(zone) {
+function buildZonePrompt(zone) {
+    const zoneCn = ZONE_LABEL_CN[zone];
+    let prompt = `（系统提示，非正文，请勿输出任何解释或前后缀：{{user}}刚刚轻轻碰了碰你的${zoneCn}。请你以你当前扮演的角色身份，用不超过20个字的一句话做出简短反应，只输出这一句反应内容本身，不要包含引号、旁白、动作描写或任何解释。）`;
+    try {
+        const ctx = getContext();
+        if (ctx && typeof ctx.substituteParams === "function") {
+            prompt = ctx.substituteParams(prompt);
+        }
+    } catch (err) { /* 忽略，用原文 */ }
+    return prompt;
+}
+
+// 方式一：走酒馆当前主线路（跟聊天共用额度）
+async function generateMainApiReaction(zone) {
     try {
         const ctx = getContext();
         if (!ctx || typeof ctx.generateQuietPrompt !== "function") return null;
-        const zoneCn = ZONE_LABEL_CN[zone];
-        let prompt = `（系统提示，非正文，请勿输出任何解释或前后缀：{{user}}刚刚轻轻碰了碰你的${zoneCn}。请你以你当前扮演的角色身份，用不超过20个字的一句话做出简短反应，只输出这一句反应内容本身，不要包含引号、旁白、动作描写或任何解释。）`;
-        if (typeof ctx.substituteParams === "function") {
-            prompt = ctx.substituteParams(prompt);
-        }
+        const prompt = buildZonePrompt(zone);
         const result = await ctx.generateQuietPrompt({ quietPrompt: prompt });
         if (typeof result === "string" && result.trim()) {
             return result.trim().replace(/^["“]|["”]$/g, "").slice(0, 60);
         }
         return null;
     } catch (err) {
-        console.warn("[桌宠] AI生成反应失败，改用固定台词：", err);
+        console.warn("[桌宠] 主线路生成失败，改用固定台词：", err);
+        return null;
+    }
+}
+
+// 方式二：走独立配置的第三方API（跟主线路完全分开，OpenAI兼容格式）
+async function generateCustomApiReaction(zone) {
+    const cfg = settings.customApi;
+    if (!cfg || !cfg.baseUrl || !cfg.model) return null;
+    try {
+        const prompt = buildZonePrompt(zone);
+        const res = await fetch(cfg.baseUrl, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                ...(cfg.apiKey ? { "Authorization": "Bearer " + cfg.apiKey } : {}),
+            },
+            body: JSON.stringify({
+                model: cfg.model,
+                messages: [{ role: "user", content: prompt }],
+                max_tokens: 60,
+                temperature: 0.9,
+            }),
+        });
+        if (!res.ok) {
+            console.warn("[桌宠] 独立API请求失败：", res.status, await res.text().catch(() => ""));
+            return null;
+        }
+        const data = await res.json();
+        const text = data?.choices?.[0]?.message?.content
+            || data?.choices?.[0]?.text
+            || data?.content?.[0]?.text
+            || null;
+        if (typeof text === "string" && text.trim()) {
+            return text.trim().replace(/^["“]|["”]$/g, "").slice(0, 60);
+        }
+        return null;
+    } catch (err) {
+        console.warn("[桌宠] 独立API调用出错，改用固定台词：", err);
         return null;
     }
 }
@@ -171,16 +232,26 @@ async function handlePet(clientY) {
     bounceZone(zone);
     showTouchSprite(1200);
 
-    if (settings.aiEnabled) {
-        if (isGenerating) return;
-        isGenerating = true;
-        showBubble("...");
-        const aiText = await generateAIReaction(zone);
-        isGenerating = false;
-        showBubble(aiText || randomZonePhrase(zone));
-    } else {
+    const mode = settings.reactionMode || "fixed";
+
+    if (mode === "fixed") {
         showBubble(randomZonePhrase(zone));
+        return;
     }
+
+    if (isGenerating) return; // 避免连续点击并发请求
+    isGenerating = true;
+    showBubble("...");
+
+    let aiText = null;
+    if (mode === "mainApi") {
+        aiText = await generateMainApiReaction(zone);
+    } else if (mode === "customApi") {
+        aiText = await generateCustomApiReaction(zone);
+    }
+
+    isGenerating = false;
+    showBubble(aiText || randomZonePhrase(zone));
 }
 
 function openMenu(clientX, clientY) {
@@ -400,10 +471,31 @@ function buildSettingsPanel() {
                 <hr>
 
                 <div class="dp-settings-row">
-                    <label><input type="checkbox" id="dp-ai-toggle"> 用当前角色AI实时生成反应（会真实消耗一次API请求，谨慎在有用量限制的站点频繁使用）</label>
+                    <span>反应来源</span>
+                    <select id="dp-reaction-mode">
+                        <option value="fixed">固定台词（不耗任何API）</option>
+                        <option value="mainApi">酒馆当前主线路（跟聊天共用额度）</option>
+                        <option value="customApi">独立API（自己填地址，跟主线路分开算）</option>
+                    </select>
                 </div>
 
-                <p class="dp-hint">下面是摸不同区域时的固定台词，AI关闭时使用；开启AI后，AI生成失败/超时也会用这些兜底。一行一句。</p>
+                <div id="dp-custom-api-block" style="display:none;">
+                    <div class="dp-zone-block">
+                        <label>接口地址（OpenAI兼容格式，例如 https://xxx/v1/chat/completions）</label>
+                        <input type="text" id="dp-api-url" style="width:100%;box-sizing:border-box;" placeholder="https://your-proxy.com/v1/chat/completions">
+                        <label style="margin-top:6px;">API Key（没有就留空）</label>
+                        <input type="text" id="dp-api-key" style="width:100%;box-sizing:border-box;" placeholder="sk-xxxxxxxx">
+                        <label style="margin-top:6px;">模型名称</label>
+                        <input type="text" id="dp-api-model" style="width:100%;box-sizing:border-box;" placeholder="gpt-4o-mini / claude-haiku-4-5 等">
+                        <div class="dp-settings-row">
+                            <div class="menu_button dp-settings-btn" id="dp-settings-test-api">测试连接</div>
+                            <span id="dp-api-test-result" class="dp-hint"></span>
+                        </div>
+                        <p class="dp-hint">如果测试一直失败，可能是这个接口不允许浏览器直接跨域调用（CORS），不是所有代理站都支持这种用法，需要换一个支持浏览器直连的接口。</p>
+                    </div>
+                </div>
+
+                <p class="dp-hint">下面是摸不同区域时的固定台词，"固定台词"模式下使用；用API的两种模式下，生成失败/超时时也会用这些兜底。一行一句。</p>
 
                 <div class="dp-zone-block">
                     <label>头顶区域台词</label>
@@ -419,7 +511,10 @@ function buildSettingsPanel() {
                 </div>
                 <div class="dp-settings-row">
                     <div class="menu_button dp-settings-btn" id="dp-settings-save-phrases">保存台词</div>
+                    <div class="menu_button dp-settings-btn" id="dp-settings-import-phrases">从文件导入台词</div>
+                    <div class="menu_button dp-settings-btn" id="dp-settings-export-phrases">导出当前台词</div>
                 </div>
+                <input type="file" id="dp-phrases-file-input" accept="application/json" style="display:none;">
 
                 <small class="dp-hint">拖动桌宠可以移动位置；轻点它上/中/下不同区域会有不同反应；右键（或长按）呼出菜单可更换图片 / 隐藏。</small>
             </div>
@@ -437,18 +532,31 @@ function buildSettingsPanel() {
     const $sizeSlider = $panel.find("#dp-size-slider");
     const $sizeLabel = $panel.find("#dp-size-label");
     const $resetPos = $panel.find("#dp-settings-reset-pos");
-    const $aiToggle = $panel.find("#dp-ai-toggle");
+    const $reactionMode = $panel.find("#dp-reaction-mode");
+    const $customApiBlock = $panel.find("#dp-custom-api-block");
+    const $apiUrl = $panel.find("#dp-api-url");
+    const $apiKey = $panel.find("#dp-api-key");
+    const $apiModel = $panel.find("#dp-api-model");
+    const $testApi = $panel.find("#dp-settings-test-api");
+    const $testResult = $panel.find("#dp-api-test-result");
     const $zoneHead = $panel.find("#dp-zone-head");
     const $zoneBody = $panel.find("#dp-zone-body");
     const $zoneTail = $panel.find("#dp-zone-tail");
     const $savePhrases = $panel.find("#dp-settings-save-phrases");
+    const $importPhrases = $panel.find("#dp-settings-import-phrases");
+    const $exportPhrases = $panel.find("#dp-settings-export-phrases");
+    const $phrasesFileInput = $panel.find("#dp-phrases-file-input");
 
     $enable.prop("checked", settings.enabled);
     $preview.attr("src", settings.imageData || DEFAULT_SPRITE);
     $previewTouch.attr("src", settings.imageDataTouch || settings.imageData || DEFAULT_SPRITE);
     $sizeSlider.val(settings.size);
     $sizeLabel.text(settings.size + "px");
-    $aiToggle.prop("checked", settings.aiEnabled);
+    $reactionMode.val(settings.reactionMode || "fixed");
+    $customApiBlock.toggle(settings.reactionMode === "customApi");
+    $apiUrl.val(settings.customApi.baseUrl || "");
+    $apiKey.val(settings.customApi.apiKey || "");
+    $apiModel.val(settings.customApi.model || "");
     $zoneHead.val(zonesToTextarea("head"));
     $zoneBody.val(zonesToTextarea("body"));
     $zoneTail.val(zonesToTextarea("tail"));
@@ -476,9 +584,29 @@ function buildSettingsPanel() {
         applyPosition();
     });
 
-    $aiToggle.on("change", function () {
-        settings.aiEnabled = $(this).is(":checked");
+    $reactionMode.on("change", function () {
+        settings.reactionMode = $(this).val();
         persist();
+        $customApiBlock.toggle(settings.reactionMode === "customApi");
+    });
+
+    $apiUrl.on("change", function () { settings.customApi.baseUrl = $(this).val().trim(); persist(); });
+    $apiKey.on("change", function () { settings.customApi.apiKey = $(this).val().trim(); persist(); });
+    $apiModel.on("change", function () { settings.customApi.model = $(this).val().trim(); persist(); });
+
+    $testApi.on("click", async function () {
+        $testResult.text("测试中...");
+        // 先临时用当前输入框的值测试，即使还没点保存
+        const tempCfg = {
+            baseUrl: $apiUrl.val().trim(),
+            apiKey: $apiKey.val().trim(),
+            model: $apiModel.val().trim(),
+        };
+        const backup = settings.customApi;
+        settings.customApi = tempCfg;
+        const result = await generateCustomApiReaction("body");
+        settings.customApi = backup;
+        $testResult.text(result ? ("成功：" + result) : "失败，看看浏览器控制台(F12)的报错信息");
     });
 
     $savePhrases.on("click", function () {
@@ -490,6 +618,48 @@ function buildSettingsPanel() {
         settings.zonePhrases.tail = t.length ? t : structuredClone(DEFAULT_ZONE_PHRASES.tail);
         persist();
         if (typeof toastr !== "undefined" && toastr.success) toastr.success("台词已保存");
+    });
+
+    $importPhrases.on("click", () => $phrasesFileInput.trigger("click"));
+
+    $phrasesFileInput.on("change", function (e) {
+        const file = e.target.files && e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = function (ev) {
+            try {
+                const data = JSON.parse(ev.target.result);
+                const h = Array.isArray(data.head) ? data.head : null;
+                const b = Array.isArray(data.body) ? data.body : null;
+                const t = Array.isArray(data.tail) ? data.tail : null;
+                if (!h && !b && !t) throw new Error("文件里没有找到 head/body/tail 数组");
+                if (h) settings.zonePhrases.head = h;
+                if (b) settings.zonePhrases.body = b;
+                if (t) settings.zonePhrases.tail = t;
+                persist();
+                $zoneHead.val(zonesToTextarea("head"));
+                $zoneBody.val(zonesToTextarea("body"));
+                $zoneTail.val(zonesToTextarea("tail"));
+                if (typeof toastr !== "undefined" && toastr.success) toastr.success("台词导入成功");
+            } catch (err) {
+                console.warn("[桌宠] 台词文件解析失败：", err);
+                if (typeof toastr !== "undefined" && toastr.error) toastr.error("文件格式不对，需要 {head:[...], body:[...], tail:[...]} 这样的JSON");
+            }
+        };
+        reader.readAsText(file);
+        $phrasesFileInput.val("");
+    });
+
+    $exportPhrases.on("click", function () {
+        const blob = new Blob([JSON.stringify(settings.zonePhrases, null, 4)], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "桌宠台词.json";
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
     });
 
     $fileInput.on("change", () => setTimeout(() => $preview.attr("src", settings.imageData || DEFAULT_SPRITE), 50));
