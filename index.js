@@ -162,7 +162,7 @@ function getZoneFromClientY(clientY) {
 
 function buildZonePrompt(zone) {
     const zoneCn = ZONE_LABEL_CN[zone];
-    let prompt = `（系统提示，非正文，请勿输出任何解释或前后缀：{{user}}刚刚轻轻碰了碰你的${zoneCn}。请你以你当前扮演的角色身份，用不超过20个字的一句话做出简短反应，只输出这一句反应内容本身，不要包含引号、旁白、动作描写或任何解释。）`;
+    let prompt = `（系统提示，非正文，请勿输出任何解释或前后缀：{{user}}刚刚轻轻碰了碰你的${zoneCn}。请你以你当前扮演的角色身份，用不超过20个字的一句话做出简短反应。直接给出这句反应本身，不要输出任何思考过程、推理步骤、分析、标签（比如<think>、<reasoning>之类），不要分段，不要加引号、旁白、动作描写或任何解释，只要最终这一句话。）`;
     try {
         const ctx = getContext();
         if (ctx && typeof ctx.substituteParams === "function") {
@@ -172,6 +172,37 @@ function buildZonePrompt(zone) {
     return prompt;
 }
 
+// 清洗AI返回内容：去掉常见思维链标签/大段推理，尽量只留最后那句实际回复
+function cleanAIResponse(raw) {
+    if (typeof raw !== "string") return null;
+    let text = raw;
+
+    // 成对的思维链标签，连内容一起删
+    const pairedTag = /<\s*(think|thinking|reasoning|thought|cot|scratchpad|analysis)[^>]*>[\s\S]*?<\s*\/\s*\1\s*>/gi;
+    text = text.replace(pairedTag, "");
+
+    // 残留的单个标签（没闭合的情况），只删标签本身
+    text = text.replace(/<\s*\/?\s*(think|thinking|reasoning|thought|cot|scratchpad|analysis)[^>]*>/gi, "");
+
+    text = text.trim();
+
+    // 如果清完还是很长，说明思考内容可能没被标签包住，退而求其次取最后一段/最后一句
+    if (text.length > 60) {
+        const paragraphs = text.split(/\n+/).map(s => s.trim()).filter(Boolean);
+        if (paragraphs.length > 1) {
+            text = paragraphs[paragraphs.length - 1];
+        } else {
+            // 单段但很长，按句号/感叹号/问号切一下，取最后一句
+            const sentences = text.split(/(?<=[。！？!?])/).map(s => s.trim()).filter(Boolean);
+            if (sentences.length > 1) text = sentences[sentences.length - 1];
+        }
+    }
+
+    text = text.replace(/^["“]|["”]$/g, "").trim();
+    if (!text) return null;
+    return text.slice(0, 60);
+}
+
 // 方式一：走酒馆当前主线路（跟聊天共用额度）
 async function generateMainApiReaction(zone) {
     try {
@@ -179,10 +210,7 @@ async function generateMainApiReaction(zone) {
         if (!ctx || typeof ctx.generateQuietPrompt !== "function") return null;
         const prompt = buildZonePrompt(zone);
         const result = await ctx.generateQuietPrompt({ quietPrompt: prompt });
-        if (typeof result === "string" && result.trim()) {
-            return result.trim().replace(/^["“]|["”]$/g, "").slice(0, 60);
-        }
-        return null;
+        return cleanAIResponse(result);
     } catch (err) {
         console.warn("[桌宠] 主线路生成失败，改用固定台词：", err);
         return null;
@@ -218,7 +246,7 @@ async function generateCustomApiReaction(zone) {
             || data?.content?.[0]?.text
             || null;
         if (typeof text === "string" && text.trim()) {
-            return text.trim().replace(/^["“]|["”]$/g, "").slice(0, 60);
+            return cleanAIResponse(text);
         }
         return null;
     } catch (err) {
